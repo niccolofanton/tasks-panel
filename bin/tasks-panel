@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { homedir, hostname } from 'node:os'
+import { dirname, join } from 'node:path'
+
+const FILE = process.env.TASKS_PANEL_FILE ?? join(homedir(), '.claude', 'tasks-panel', 'tasks.json')
+const USAGE = `usage:
+  tasks-panel set <id> [--desc TEXT] [--step N] [--total M] [--machine NAME]
+                       [--status running|done|failed] [--stale-after SEC] [--session ID]
+  Tasks belong to a Claude Code session: --session, else $CLAUDE_CODE_SESSION_ID.
+  tasks-panel done <id>
+  tasks-panel rm <id>
+  tasks-panel clear        remove done and failed tasks
+  tasks-panel list`
+
+const load = () => {
+  try {
+    return JSON.parse(readFileSync(FILE, 'utf8'))
+  } catch (err) {
+    if (err.code === 'ENOENT') return { tasks: {} }
+    throw err
+  }
+}
+
+const save = data => {
+  mkdirSync(dirname(FILE), { recursive: true })
+  const tmp = `${FILE}.${process.pid}.tmp`
+  writeFileSync(tmp, JSON.stringify(data, null, 2))
+  renameSync(tmp, FILE)
+}
+
+const parseFlags = args => {
+  const flags = {}
+  for (let i = 0; i < args.length; i += 2) {
+    const name = args[i]
+    if (!name.startsWith('--') || args[i + 1] === undefined) throw new Error(`bad flag: ${name}`)
+    flags[name.slice(2)] = args[i + 1]
+  }
+  return flags
+}
+
+const toNumber = (value, name) => {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n < 0) throw new Error(`--${name} must be a non-negative number`)
+  return n
+}
+
+const [cmd, ...args] = process.argv.slice(2)
+// only set/done/rm take an <id>; list and clear take flags straight after the command
+const takesId = ['set', 'done', 'rm'].includes(cmd)
+const id = takesId ? args[0] : undefined
+const rest = takesId ? args.slice(1) : args
+const envSession = process.env.CLAUDE_CODE_SESSION_ID
+
+try {
+  const data = load()
+  const now = Date.now()
+
+  const flags = parseFlags(rest)
+  const session = flags.session ?? envSession
+  const needsSession = ['set', 'done', 'rm'].includes(cmd)
+  if (needsSession && !session) throw new Error('no session: pass --session <id> or run inside Claude Code')
+  const key = `${session}/${id}`
+
+  if (cmd === 'set' && id) {
+    const prev = data.tasks[key]
+    const task = prev ?? { desc: id, step: 0, total: 0, machine: hostname().split('.')[0], status: 'running', startedAt: now, staleAfterSec: 60 }
+    task.id = id
+    task.session = session
+    if (flags.desc !== undefined) task.desc = flags.desc
+    if (flags.step !== undefined) task.step = toNumber(flags.step, 'step')
+    if (flags.total !== undefined) task.total = toNumber(flags.total, 'total')
+    if (flags.machine !== undefined) task.machine = flags.machine
+    if (flags['stale-after'] !== undefined) task.staleAfterSec = toNumber(flags['stale-after'], 'stale-after')
+    if (flags.status !== undefined) {
+      if (!['running', 'done', 'failed'].includes(flags.status)) throw new Error('--status must be running, done or failed')
+      task.status = flags.status
+    }
+    // a restart from step 0 is a new run: reset the clock the ETA is measured from
+    if (prev && flags.step !== undefined && task.step === 0) task.startedAt = now
+    if (flags.step !== undefined && flags.status === undefined) task.status = 'running'
+    task.updatedAt = now
+    data.tasks[key] = task
+  } else if (cmd === 'done' && id) {
+    const task = data.tasks[key]
+    if (!task) throw new Error(`no task ${id} in session ${session}`)
+    Object.assign(task, { status: 'done', step: task.total || task.step, updatedAt: now })
+  } else if (cmd === 'rm' && id) {
+    delete data.tasks[key]
+  } else if (cmd === 'clear') {
+    for (const [entry, task] of Object.entries(data.tasks)) {
+      if (task.status !== 'running' && (!session || task.session === session)) delete data.tasks[entry]
+    }
+  } else if (cmd === 'list') {
+    const mine = Object.entries(data.tasks).filter(([, task]) => !session || task.session === session)
+    console.log(JSON.stringify(Object.fromEntries(mine), null, 2))
+    process.exit(0)
+  } else {
+    console.error(USAGE)
+    process.exit(2)
+  }
+
+  save(data)
+} catch (err) {
+  console.error(`tasks-panel: ${err.message}`)
+  process.exit(1)
+}

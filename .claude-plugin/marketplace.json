@@ -1,0 +1,5 @@
+{
+  "name": "tasks-panel",
+  "owner": { "name": "tasks-panel" },
+  "plugins": [{ "name": "tasks-panel", "source": "./" }]
+}
